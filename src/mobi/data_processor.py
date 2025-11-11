@@ -303,7 +303,7 @@ def save_to_parquet(
     compression: str = "snappy",
 ) -> Path:
     """
-    Save a DataFrame to a Parquet file.
+    Save a DataFrame to a Parquet file (Spark/Delta compatible).
 
     Args:
         df: DataFrame to save
@@ -320,7 +320,17 @@ def save_to_parquet(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        df.to_parquet(output_path, compression=compression, index=False)
+        # Use pyarrow engine and coerce timestamps to microseconds so Spark can read the file
+        # without TIMESTAMP(NANOS) incompatibility. This is important when Spark reads the Parquet
+        # directly (as opposed to pandas→Spark conversion).
+        df.to_parquet(
+            output_path,
+            engine="pyarrow",
+            compression=compression,
+            index=False,
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         file_size_mb = output_path.stat().st_size / (1024 * 1024)
         print(f"\n✓ Saved to {output_path}")
         print(f"  File size: {file_size_mb:.2f} MB")
