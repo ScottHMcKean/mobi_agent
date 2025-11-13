@@ -8,8 +8,7 @@ historic bike share trip data from https://www.mobibikes.ca/en/system-data
 import re
 import shutil
 import zipfile
-from pathlib import Path, PurePosixPath
-from typing import List
+from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
@@ -25,7 +24,7 @@ class MobiDataDownloaderError(Exception):
 def get_available_data_files(
     base_url: str = "https://www.mobibikes.ca/en/system-data",
     timeout: int = 30,
-) -> List[dict]:
+) -> list[dict]:
     """
     Scrape the Mobi system data page to find all available CSV download links.
 
@@ -174,7 +173,7 @@ def download_all_trip_data(
     output_dir: Path,
     base_url: str = "https://www.mobibikes.ca/en/system-data",
     overwrite: bool = False,
-) -> List[Path]:
+) -> list[Path]:
     """
     Download all available historic trip data CSV files.
 
@@ -224,172 +223,65 @@ def download_all_trip_data(
     return downloaded_files
 
 
-def _resolve_volume_root(target_dir: Path) -> Path:
+def restore_from_backup(volume_root: Path, bundle_path: Path) -> dict[str, Path]:
     """
-    Infer the Unity Catalog volume root from a nested destination directory.
+    Restore bundled assets (trip data and mobi site content) into the target volume.
+
+    This function unpacks ``data.zip`` into a temporary directory, moves the
+    ``trip_data`` and ``mobi_site`` directories to the top level of ``volume_root``,
+    and overwrites any existing directories with the bundled copies.
 
     Args:
-        target_dir: Directory within the volume hierarchy.
+        volume_root: Unity Catalog volume root (e.g., ``/Volumes/.../raw_data``).
+        bundle_path: Path to the project-supplied ``data.zip`` archive.
 
     Returns:
-        The inferred volume root directory.
-    """
-    try:
-        return target_dir.parents[1]
-    except IndexError:
-        return target_dir.parent
-
-
-def _ensure_bundle_available(bundle_path: Path, volume_root: Path) -> Path:
-    """
-    Ensure the offline bundle is present on the Unity Catalog volume.
-
-    Args:
-        bundle_path: Local path to the bundle shipped with the project.
-        volume_root: Destination directory on the volume.
-
-    Returns:
-        Path to the bundle located on the volume.
+        Mapping of restored directory names to their destination paths.
 
     Raises:
-        FileNotFoundError: If the bundle cannot be found in either location.
+        FileNotFoundError: If ``bundle_path`` does not exist.
+        RuntimeError: If required directories are missing from the archive.
     """
-    target_zip = volume_root / bundle_path.name
+    from tempfile import TemporaryDirectory
 
-    if target_zip.exists():
-        return target_zip
+    volume_root = Path(volume_root)
+    bundle_path = Path(bundle_path)
 
-    if bundle_path.exists():
-        target_zip.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(bundle_path, target_zip)
-        return target_zip
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Fallback bundle not found at {bundle_path}")
 
-    raise FileNotFoundError(
-        f"Fallback bundle not found at {bundle_path} or {target_zip}"
-    )
+    volume_root.mkdir(parents=True, exist_ok=True)
 
+    restored: dict[str, Path] = {}
+    with TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        with zipfile.ZipFile(bundle_path, "r") as archive:
+            archive.extractall(tmpdir_path)
 
-def _extract_bundle(archive_path: Path, destination: Path) -> List[Path]:
-    """
-    Extract the contents of the bundle into the destination, flattening the root folder.
+        base_dir = tmpdir_path / "data"
+        if not base_dir.exists():
+            base_dir = tmpdir_path
 
-    Args:
-        archive_path: Path to the offline bundle on the volume.
-        destination: Target directory on the volume.
+        for dirname in ("trip_data", "mobi_site"):
+            src_dir = base_dir / dirname
+            if not src_dir.exists():
+                raise RuntimeError(
+                    f"Fallback archive is missing the '{dirname}' directory"
+                )
 
-    Returns:
-        List of extracted file paths.
-    """
-    destination.mkdir(parents=True, exist_ok=True)
-    extracted_paths: List[Path] = []
+            dst_dir = volume_root / dirname
+            if dst_dir.exists():
+                shutil.rmtree(dst_dir)
 
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        for member in archive.infolist():
-            if member.is_dir():
-                continue
+            shutil.move(str(src_dir), str(dst_dir))
+            restored[dirname] = dst_dir
 
-            filename = member.filename
-            while filename.startswith("./"):
-                filename = filename[2:]
-            filename = filename.lstrip("/")
+        leftover_data_dir = volume_root / "data"
+        if leftover_data_dir.exists() and leftover_data_dir.is_dir():
+            try:
+                leftover_data_dir.rmdir()
+            except OSError:
+                shutil.rmtree(leftover_data_dir, ignore_errors=True)
 
-            if not filename:
-                continue
-
-            parts = Path(filename).parts
-            if len(parts) > 1:
-                relative_parts = parts[1:]
-            else:
-                relative_parts = parts
-
-            target_path = destination.joinpath(*relative_parts)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with archive.open(member) as src, open(target_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-
-            extracted_paths.append(target_path)
-
-    return extracted_paths
-
-
-def restore_trip_data_from_bundle(raw_dir: Path, bundle_path: Path) -> List[Path]:
-    """
-    Restore trip CSV files from the offline bundle when downloads fail.
-
-    Args:
-        raw_dir: Destination directory for raw trip CSV files.
-        bundle_path: Path to the offline bundle.
-
-    Returns:
-        Sorted list of CSV file paths available in `raw_dir`.
-
-    Raises:
-        FileNotFoundError: If the bundle cannot be located.
-        RuntimeError: If extraction completes without producing CSV files.
-    """
-    existing_csvs = sorted(raw_dir.glob("*.csv"))
-    if existing_csvs:
-        return existing_csvs
-
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    volume_root = _resolve_volume_root(raw_dir)
-    archive_path = _ensure_bundle_available(bundle_path, volume_root)
-
-    extracted_files = _extract_bundle(archive_path=archive_path, destination=raw_dir)
-
-    csv_paths = sorted(path for path in extracted_files if path.suffix.lower() == ".csv")
-    if not csv_paths:
-        csv_paths = sorted(raw_dir.glob("*.csv"))
-
-    if not csv_paths:
-        raise RuntimeError(
-            f"No CSV files were extracted from fallback bundle {archive_path}"
-        )
-
-    return csv_paths
-
-
-def restore_site_data_from_bundle(site_raw_dir: Path, bundle_path: Path) -> List[Path]:
-    """
-    Restore site markdown files from the offline bundle when scraping fails.
-
-    Args:
-        site_raw_dir: Destination directory for raw markdown content.
-        bundle_path: Path to the offline bundle.
-
-    Returns:
-        Sorted list of markdown file paths available in `site_raw_dir`.
-
-    Raises:
-        FileNotFoundError: If the bundle cannot be located.
-        RuntimeError: If extraction completes without producing markdown files.
-    """
-    existing_markdown = sorted(
-        path for path in site_raw_dir.glob("*.md") if path.is_file()
-    )
-    if existing_markdown:
-        return existing_markdown
-
-    site_raw_dir.mkdir(parents=True, exist_ok=True)
-    volume_root = _resolve_volume_root(site_raw_dir)
-    archive_path = _ensure_bundle_available(bundle_path, volume_root)
-
-    extracted_files = _extract_bundle(
-        archive_path=archive_path,
-        destination=site_raw_dir,
-    )
-
-    markdown_paths = sorted(
-        path for path in extracted_files if path.suffix.lower() in {".md", ".markdown"}
-    )
-    if not markdown_paths:
-        markdown_paths = sorted(site_raw_dir.glob("*.md"))
-
-    if not markdown_paths:
-        raise RuntimeError(
-            f"No markdown files were extracted from fallback bundle {archive_path}"
-        )
-
-    return markdown_paths
+    return restored
 
