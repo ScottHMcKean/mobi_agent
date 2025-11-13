@@ -269,55 +269,48 @@ def _ensure_bundle_available(bundle_path: Path, volume_root: Path) -> Path:
     )
 
 
-def _extract_bundle_subdir(
-    archive_path: Path,
-    archive_subdir: str,
-    destination: Path,
-) -> List[Path]:
+def _extract_bundle(archive_path: Path, destination: Path) -> List[Path]:
     """
-    Extract a subdirectory from the offline bundle into the destination.
+    Extract the contents of the bundle into the destination, flattening the root folder.
 
     Args:
         archive_path: Path to the offline bundle on the volume.
-        archive_subdir: Directory inside the archive to extract.
         destination: Target directory on the volume.
 
     Returns:
         List of extracted file paths.
-
-    Raises:
-        RuntimeError: If the requested subdirectory is not found.
     """
     destination.mkdir(parents=True, exist_ok=True)
-    extracted_files: List[Path] = []
-    prefix = PurePosixPath(archive_subdir.strip("/"))
+    extracted_paths: List[Path] = []
 
     with zipfile.ZipFile(archive_path, "r") as archive:
         for member in archive.infolist():
-            member_path = PurePosixPath(member.filename)
-
             if member.is_dir():
                 continue
 
-            try:
-                relative_path = member_path.relative_to(prefix)
-            except ValueError:
+            filename = member.filename
+            while filename.startswith("./"):
+                filename = filename[2:]
+            filename = filename.lstrip("/")
+
+            if not filename:
                 continue
 
-            target_path = destination / Path(*relative_path.parts)
+            parts = Path(filename).parts
+            if len(parts) > 1:
+                relative_parts = parts[1:]
+            else:
+                relative_parts = parts
+
+            target_path = destination.joinpath(*relative_parts)
             target_path.parent.mkdir(parents=True, exist_ok=True)
 
             with archive.open(member) as src, open(target_path, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
-            extracted_files.append(target_path)
+            extracted_paths.append(target_path)
 
-    if not extracted_files:
-        raise RuntimeError(
-            f"No files were found under '{archive_subdir}' in {archive_path}"
-        )
-
-    return extracted_files
+    return extracted_paths
 
 
 def restore_trip_data_from_bundle(raw_dir: Path, bundle_path: Path) -> List[Path]:
@@ -343,11 +336,7 @@ def restore_trip_data_from_bundle(raw_dir: Path, bundle_path: Path) -> List[Path
     volume_root = _resolve_volume_root(raw_dir)
     archive_path = _ensure_bundle_available(bundle_path, volume_root)
 
-    extracted_files = _extract_bundle_subdir(
-        archive_path=archive_path,
-        archive_subdir="data/trip_data/raw",
-        destination=raw_dir,
-    )
+    extracted_files = _extract_bundle(archive_path=archive_path, destination=raw_dir)
 
     csv_paths = sorted(path for path in extracted_files if path.suffix.lower() == ".csv")
     if not csv_paths:
@@ -386,9 +375,8 @@ def restore_site_data_from_bundle(site_raw_dir: Path, bundle_path: Path) -> List
     volume_root = _resolve_volume_root(site_raw_dir)
     archive_path = _ensure_bundle_available(bundle_path, volume_root)
 
-    extracted_files = _extract_bundle_subdir(
+    extracted_files = _extract_bundle(
         archive_path=archive_path,
-        archive_subdir="data/mobi_site/raw",
         destination=site_raw_dir,
     )
 
@@ -404,3 +392,4 @@ def restore_site_data_from_bundle(site_raw_dir: Path, bundle_path: Path) -> List
         )
 
     return markdown_paths
+
