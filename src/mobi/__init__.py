@@ -8,7 +8,7 @@ from mobi.data_downloader import (
     MobiDataDownloaderError,
     download_all_trip_data,
     get_available_data_files,
-    restore_from_backup,
+    seed_volume_from_backup,
 )
 from mobi.data_processor import (
     DataProcessorError,
@@ -32,7 +32,7 @@ __all__ = [
     "MobiDataDownloaderError",
     "download_all_trip_data",
     "get_available_data_files",
-    "restore_from_backup",
+    "seed_volume_from_backup",
     "DataProcessorError",
     "combine_trip_data",
     "save_to_parquet",

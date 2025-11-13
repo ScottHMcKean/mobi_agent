@@ -223,17 +223,49 @@ def download_all_trip_data(
     return downloaded_files
 
 
-def restore_from_backup(volume_root: Path, bundle_path: Path) -> dict[str, Path]:
+def _copy_contents(source: Path, destination: Path, overwrite: bool) -> None:
     """
-    Restore bundled assets (trip data and mobi site content) into the target volume.
+    Copy files and directories from ``source`` into ``destination``.
 
-    This function unpacks ``data.zip`` into a temporary directory, moves the
-    ``trip_data`` and ``mobi_site`` directories to the top level of ``volume_root``,
-    and overwrites any existing directories with the bundled copies.
+    Existing files are left untouched unless ``overwrite`` is True.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+
+    for item in source.iterdir():
+        dest_path = destination / item.name
+
+        if item.is_dir():
+            if dest_path.exists() and overwrite:
+                shutil.rmtree(dest_path)
+                shutil.copytree(item, dest_path)
+            elif dest_path.exists():
+                _copy_contents(item, dest_path, overwrite)
+            else:
+                shutil.copytree(item, dest_path)
+        else:
+            if dest_path.exists():
+                if overwrite:
+                    if dest_path.is_dir():
+                        shutil.rmtree(dest_path)
+                    else:
+                        dest_path.unlink()
+                else:
+                    continue
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dest_path)
+
+
+def seed_volume_from_backup(
+    volume_root: Path, bundle_path: Path, overwrite: bool = False
+) -> dict[str, Path]:
+    """
+    Ensure the Unity Catalog volume contains the bundled trip and site data.
 
     Args:
         volume_root: Unity Catalog volume root (e.g., ``/Volumes/.../raw_data``).
         bundle_path: Path to the project-supplied ``data.zip`` archive.
+        overwrite: When True, bundled files replace existing ones; otherwise only
+            missing files are copied.
 
     Returns:
         Mapping of restored directory names to their destination paths.
@@ -252,7 +284,16 @@ def restore_from_backup(volume_root: Path, bundle_path: Path) -> dict[str, Path]
 
     volume_root.mkdir(parents=True, exist_ok=True)
 
-    restored: dict[str, Path] = {}
+    target_dirs = {name: volume_root / name for name in ("trip_data", "mobi_site")}
+    sentinel = volume_root / ".backup_seeded"
+
+    if (
+        sentinel.exists()
+        and not overwrite
+        and all(path.exists() for path in target_dirs.values())
+    ):
+        return target_dirs
+
     with TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         with zipfile.ZipFile(bundle_path, "r") as archive:
@@ -262,26 +303,15 @@ def restore_from_backup(volume_root: Path, bundle_path: Path) -> dict[str, Path]
         if not base_dir.exists():
             base_dir = tmpdir_path
 
-        for dirname in ("trip_data", "mobi_site"):
+        for dirname, dest_dir in target_dirs.items():
             src_dir = base_dir / dirname
             if not src_dir.exists():
                 raise RuntimeError(
                     f"Fallback archive is missing the '{dirname}' directory"
                 )
 
-            dst_dir = volume_root / dirname
-            if dst_dir.exists():
-                shutil.rmtree(dst_dir)
+            _copy_contents(src_dir, dest_dir, overwrite=overwrite)
 
-            shutil.move(str(src_dir), str(dst_dir))
-            restored[dirname] = dst_dir
-
-        leftover_data_dir = volume_root / "data"
-        if leftover_data_dir.exists() and leftover_data_dir.is_dir():
-            try:
-                leftover_data_dir.rmdir()
-            except OSError:
-                shutil.rmtree(leftover_data_dir, ignore_errors=True)
-
-    return restored
+    sentinel.touch()
+    return target_dirs
 

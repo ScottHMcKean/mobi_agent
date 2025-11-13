@@ -6,3 +6,4 @@ scrape_url: https://www.mobibikes.ca/en/
 scrape_max_depth: 5
 scrape_delay: 0.1
 shuffle_partitions: 64
+overwrite_downloads: false
