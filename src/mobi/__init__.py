@@ -8,6 +8,7 @@ from mobi.data_downloader import (
     MobiDataDownloaderError,
     download_all_trip_data,
     get_available_data_files,
+    seed_volume_from_backup,
 )
 from mobi.data_processor import (
     DataProcessorError,
@@ -21,6 +22,8 @@ from mobi.station_data import (
     fetch_station_status_from_gbfs,
 )
 
+from mobi.basic_site_scraper import BasicSiteScraper
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -29,10 +32,12 @@ __all__ = [
     "MobiDataDownloaderError",
     "download_all_trip_data",
     "get_available_data_files",
+    "seed_volume_from_backup",
     "DataProcessorError",
     "combine_trip_data",
     "save_to_parquet",
     "StationDataError",
     "fetch_station_info_from_gbfs",
     "fetch_station_status_from_gbfs",
+    "BasicSiteScraper",
 ]

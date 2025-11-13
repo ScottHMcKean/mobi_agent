@@ -1,26 +1,50 @@
 """
-Module for processing and standardizing Mobi bike share data.
+Module for processing Mobi bike share data.
 
-This module handles reading CSV files, standardizing schemas across different
-data formats, and combining data into a unified format.
+This module handles reading raw CSV files and combining them into a unified
+bronze dataset without altering the source schema.
 """
 
-import zipfile
+import re
 from pathlib import Path
-from typing import List, Optional
 
 import pandas as pd
+from loguru import logger
 
 
 class DataProcessorError(Exception):
     """Base exception for data processor errors."""
 
-    pass
+
+def _sanitize_columns(column_names: list[str]) -> list[str]:
+    """
+    Produce Spark-safe, unique column names using lower snake-case.
+
+    Args:
+        column_names: Original column names.
+
+    Returns:
+        List of sanitized column names with duplicates disambiguated.
+    """
+    sanitized: list[str] = []
+
+    for raw_name in column_names:
+        name = str(raw_name).strip().lower()
+        name = re.sub(r"[^a-z0-9_]+", "_", name)
+        name = re.sub(r"_+", "_", name).strip("_")
+        if not name:
+            name = "column"
+        if name[0].isdigit():
+            name = f"_{name}"
+
+        sanitized.append(name)
+
+    return sanitized
 
 
 def read_trip_data_file(file_path: Path) -> pd.DataFrame:
     """
-    Read a trip data file (CSV or ZIP) into a DataFrame.
+    Read a trip data CSV file into a DataFrame.
 
     Args:
         file_path: Path to the data file
@@ -29,110 +53,57 @@ def read_trip_data_file(file_path: Path) -> pd.DataFrame:
         DataFrame containing the trip data
 
     Raises:
-        DataProcessorError: If the file cannot be read
+        DataProcessorError: If the file type is unsupported or cannot be read
     """
     file_path = Path(file_path)
 
-    try:
-        if file_path.suffix.lower() == ".zip":
-            # Extract and read CSV from ZIP
-            with zipfile.ZipFile(file_path, "r") as zip_ref:
-                # Find CSV file in the ZIP
-                csv_files = [f for f in zip_ref.namelist() if f.endswith(".csv")]
-                if not csv_files:
-                    raise DataProcessorError(f"No CSV file found in {file_path}")
+    last_exception = None
+    for encoding in ("utf-8", "latin1"):
+        try:
+            df = pd.read_csv(
+                file_path,
+                encoding=encoding,
+                on_bad_lines="skip",
+                low_memory=False,
+            )
+            logger.info(
+                "Successfully read {file_name} with encoding {encoding}",
+                file_name=file_path.name,
+                encoding=encoding,
+            )
+            return df
+        except UnicodeDecodeError as exc:
+            last_exception = exc
+            logger.warning(
+                "Failed to decode {file_name} with encoding {encoding}",
+                file_name=file_path.name,
+                encoding=encoding,
+            )
+        except (pd.errors.ParserError, pd.errors.EmptyDataError, OSError, ValueError) as exc:
+            last_exception = exc
+            logger.warning(
+                "Error while reading {file_name} with encoding {encoding}: {error}",
+                file_name=file_path.name,
+                encoding=encoding,
+                error=exc,
+            )
 
-                # Read the first CSV file
-                with zip_ref.open(csv_files[0]) as csv_file:
-                    df = pd.read_csv(csv_file)
-        else:
-            # Read CSV directly
-            df = pd.read_csv(file_path)
+    error_message = (
+        f"Failed to read {file_path.name} using UTF-8 or Latin-1 encodings"
+    )
+    logger.error(
+        "{message}. Last error: {error}",
+        message=error_message,
+        error=last_exception,
+    )
+    raise DataProcessorError(error_message) from last_exception
 
-        return df
-
-    except Exception as e:
-        raise DataProcessorError(f"Failed to read {file_path}: {e}")
-
-
-def standardize_trip_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Standardize the schema of a trip data DataFrame.
-
-    Mobi data may have different column names over time. This function
-    normalizes them to a consistent format.
-
-    Args:
-        df: Input DataFrame with trip data
-
-    Returns:
-        DataFrame with standardized column names and types
-
-    Raises:
-        DataProcessorError: If required columns are missing
-    """
-    # Create a copy to avoid modifying the original
-    df = df.copy()
-
-    # Define column name mappings (old name -> new name)
-    column_mappings = {
-        # Common variations of column names
-        "departure": "departure_time",
-        "return": "return_time",
-        "departure_station": "departure_station_name",
-        "return_station": "return_station_name",
-        "covered_distance": "covered_distance_km",
-        "duration": "duration_sec",
-        "stopover": "has_stopover",
-        "bike": "bike_id",
-        "account": "account_id",
-    }
-
-    # Apply column mappings (case-insensitive)
-    df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")
-
-    for old_name, new_name in column_mappings.items():
-        if old_name in df.columns and new_name not in df.columns:
-            df = df.rename(columns={old_name: new_name})
-
-    # Parse datetime columns if they exist
-    datetime_columns = ["departure_time", "return_time"]
-    for col in datetime_columns:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    # Convert numeric columns
-    numeric_columns = {
-        "covered_distance_km": float,
-        "duration_sec": float,
-    }
-    for col, dtype in numeric_columns.items():
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Convert boolean columns
-    if "has_stopover" in df.columns:
-        # Handle various representations of boolean
-        df["has_stopover"] = df["has_stopover"].map(
-            {
-                "Yes": True,
-                "No": False,
-                "yes": True,
-                "no": False,
-                True: True,
-                False: False,
-            }
-        )
-
-    return df
-
-
-def combine_trip_data(file_paths: List[Path]) -> pd.DataFrame:
+def combine_trip_data(file_paths: list[Path]) -> pd.DataFrame:
     """
     Read and combine multiple trip data files into a single DataFrame.
 
     Args:
-        file_paths: List of paths to trip data files
+        file_paths: list of paths to trip data files
 
     Returns:
         Combined DataFrame with all trip data
@@ -146,28 +117,48 @@ def combine_trip_data(file_paths: List[Path]) -> pd.DataFrame:
     all_dataframes = []
 
     for i, file_path in enumerate(file_paths, 1):
-        print(f"[{i}/{len(file_paths)}] Reading {file_path.name}...")
-
+        logger.info(
+            "Reading file [{index}/{total}]: {file_name}",
+            index=i,
+            total=len(file_paths),
+            file_name=file_path.name,
+        )
         try:
             df = read_trip_data_file(file_path)
-            df = standardize_trip_schema(df)
 
             # Add metadata about the source file
             df["source_file"] = file_path.name
 
+            original_columns = list(df.columns)
+            sanitized_columns = _sanitize_columns(original_columns)
+            if original_columns != sanitized_columns:
+                mapping = {
+                    original: sanitized
+                    for original, sanitized in zip(original_columns, sanitized_columns)
+                    if original != sanitized
+                }
+            df.columns = sanitized_columns
+
             all_dataframes.append(df)
-            print(f"  ✓ Loaded {len(df):,} rows")
+            logger.info(
+                "Loaded {row_count:,} rows from {file_name}",
+                row_count=len(df),
+                file_name=file_path.name,
+            )
 
         except DataProcessorError as e:
-            print(f"  ✗ Failed: {e}")
+            logger.error("Failed to load {file_name}: {error}", file_name=file_path.name, error=e)
             continue
 
     if not all_dataframes:
         raise DataProcessorError("No data files were successfully read")
 
-    print("\nCombining all data...")
+    logger.info("Combining {file_count} dataframes", file_count=len(all_dataframes))
     combined_df = pd.concat(all_dataframes, ignore_index=True)
-    print(f"✓ Combined dataset has {len(combined_df):,} total rows")
+    logger.info(
+        "Combined dataset has {row_count:,} total rows",
+        row_count=len(combined_df),
+    )
 
     return combined_df
 
@@ -178,7 +169,7 @@ def save_to_parquet(
     compression: str = "snappy",
 ) -> Path:
     """
-    Save a DataFrame to a Parquet file.
+    Save a DataFrame to a Parquet file (Spark/Delta compatible).
 
     Args:
         df: DataFrame to save
@@ -195,47 +186,33 @@ def save_to_parquet(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        df.to_parquet(output_path, compression=compression, index=False)
+        # Use pyarrow engine and coerce timestamps to microseconds so Spark can read the file
+        # without TIMESTAMP(NANOS) incompatibility. This is important when Spark reads the Parquet
+        # directly (as opposed to pandas→Spark conversion).
+        df.to_parquet(
+            output_path,
+            engine="pyarrow",
+            compression=compression,
+            index=False,
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         file_size_mb = output_path.stat().st_size / (1024 * 1024)
-        print(f"\n✓ Saved to {output_path}")
-        print(f"  File size: {file_size_mb:.2f} MB")
-        print(f"  Rows: {len(df):,}")
-        print(f"  Columns: {len(df.columns)}")
+        logger.info("Saved dataset to {path}", path=str(output_path))
+        logger.info(
+            "File stats for {file_name}: size={size:.2f} MB, rows={rows:,}, columns={columns}",
+            file_name=output_path.name,
+            size=file_size_mb,
+            rows=len(df),
+            columns=len(df.columns),
+        )
         return output_path
 
     except Exception as e:
-        raise DataProcessorError(f"Failed to save Parquet file: {e}")
+        logger.error(
+            "Failed to save parquet file {file_name}: {error}",
+            file_name=output_path.name,
+            error=e,
+        )
+        raise DataProcessorError(f"Failed to save Parquet file: {e}") from e
 
-
-def get_data_summary(df: pd.DataFrame) -> dict:
-    """
-    Generate a summary of the trip data.
-
-    Args:
-        df: DataFrame with trip data
-
-    Returns:
-        Dict containing summary statistics
-    """
-    summary = {
-        "total_rows": len(df),
-        "total_columns": len(df.columns),
-        "columns": list(df.columns),
-        "memory_usage_mb": df.memory_usage(deep=True).sum() / (1024 * 1024),
-    }
-
-    # Date range if datetime columns exist
-    if "departure_time" in df.columns:
-        summary["date_range"] = {
-            "start": df["departure_time"].min(),
-            "end": df["departure_time"].max(),
-        }
-
-    # Null counts
-    null_counts = df.isnull().sum()
-    summary["null_counts"] = null_counts[null_counts > 0].to_dict()
-
-    # Data types
-    summary["dtypes"] = df.dtypes.astype(str).to_dict()
-
-    return summary

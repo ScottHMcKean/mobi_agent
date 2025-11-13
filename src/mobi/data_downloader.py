@@ -6,8 +6,9 @@ historic bike share trip data from https://www.mobibikes.ca/en/system-data
 """
 
 import re
+import shutil
+import zipfile
 from pathlib import Path
-from typing import List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -23,7 +24,7 @@ class MobiDataDownloaderError(Exception):
 def get_available_data_files(
     base_url: str = "https://www.mobibikes.ca/en/system-data",
     timeout: int = 30,
-) -> List[dict]:
+) -> list[dict]:
     """
     Scrape the Mobi system data page to find all available CSV download links.
 
@@ -136,22 +137,19 @@ def download_file(
 ) -> Path:
     """
     Download a file from a URL to the specified output path.
-
-    Args:
-        url: URL of the file to download
-        output_path: Local path where the file should be saved
-        timeout: Request timeout in seconds
-        chunk_size: Size of chunks to download at a time (bytes)
-
-    Returns:
-        Path to the downloaded file
-
-    Raises:
-        MobiDataDownloaderError: If the download fails
     """
     try:
         response = requests.get(url, timeout=timeout, stream=True)
         response.raise_for_status()
+
+        # 🔍 Quick check: skip HTML error/virus-scan pages that pretend to be files
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "text/html" in content_type:
+            # This is almost certainly not a real CSV/XLSX, but an interstitial page
+            raise MobiDataDownloaderError(
+                f"Got HTML content instead of a data file from {url} "
+                f"(Content-Type: {content_type})"
+            )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -168,11 +166,12 @@ def download_file(
         raise MobiDataDownloaderError(f"Failed to save file to {output_path}: {e}")
 
 
+
 def download_all_trip_data(
     output_dir: Path,
     base_url: str = "https://www.mobibikes.ca/en/system-data",
     overwrite: bool = False,
-) -> List[Path]:
+) -> list[Path]:
     """
     Download all available historic trip data CSV files.
 
@@ -220,3 +219,97 @@ def download_all_trip_data(
 
     print(f"\nDownloaded {len(downloaded_files)} file(s) to {output_dir}")
     return downloaded_files
+
+
+def _copy_contents(source: Path, destination: Path, overwrite: bool) -> None:
+    """
+    Copy files and directories from ``source`` into ``destination``.
+
+    Existing files are left untouched unless ``overwrite`` is True.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+
+    for item in source.iterdir():
+        dest_path = destination / item.name
+
+        if item.is_dir():
+            if dest_path.exists() and overwrite:
+                shutil.rmtree(dest_path)
+                shutil.copytree(item, dest_path)
+            elif dest_path.exists():
+                _copy_contents(item, dest_path, overwrite)
+            else:
+                shutil.copytree(item, dest_path)
+        else:
+            if dest_path.exists():
+                if overwrite:
+                    if dest_path.is_dir():
+                        shutil.rmtree(dest_path)
+                    else:
+                        dest_path.unlink()
+                else:
+                    continue
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dest_path)
+
+
+def seed_volume_from_backup(
+    volume_root: Path, bundle_path: Path, overwrite: bool = False
+) -> dict[str, Path]:
+    """
+    Ensure the Unity Catalog volume contains the bundled trip and site data.
+
+    Args:
+        volume_root: Unity Catalog volume root (e.g., ``/Volumes/.../raw_data``).
+        bundle_path: Path to the project-supplied ``data.zip`` archive.
+        overwrite: When True, bundled files replace existing ones; otherwise only
+            missing files are copied.
+
+    Returns:
+        Mapping of restored directory names to their destination paths.
+
+    Raises:
+        FileNotFoundError: If ``bundle_path`` does not exist.
+        RuntimeError: If required directories are missing from the archive.
+    """
+    from tempfile import TemporaryDirectory
+
+    volume_root = Path(volume_root)
+    bundle_path = Path(bundle_path)
+
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Fallback bundle not found at {bundle_path}")
+
+    volume_root.mkdir(parents=True, exist_ok=True)
+
+    target_dirs = {name: volume_root / name for name in ("trip_data", "mobi_site")}
+    sentinel = volume_root / ".backup_seeded"
+
+    if (
+        sentinel.exists()
+        and not overwrite
+        and all(path.exists() for path in target_dirs.values())
+    ):
+        return target_dirs
+
+    with TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        with zipfile.ZipFile(bundle_path, "r") as archive:
+            archive.extractall(tmpdir_path)
+
+        base_dir = tmpdir_path / "data"
+        if not base_dir.exists():
+            base_dir = tmpdir_path
+
+        for dirname, dest_dir in target_dirs.items():
+            src_dir = base_dir / dirname
+            if not src_dir.exists():
+                raise RuntimeError(
+                    f"Fallback archive is missing the '{dirname}' directory"
+                )
+
+            _copy_contents(src_dir, dest_dir, overwrite=overwrite)
+
+    sentinel.touch()
+    return target_dirs
+
